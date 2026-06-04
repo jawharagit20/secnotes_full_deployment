@@ -1,0 +1,132 @@
+stages:
+  - prepare
+  - test
+  - sast
+  - build
+  - deploy_local
+  - infra_aws
+  - deploy_aws
+
+variables:
+  APP_NAME: "secnotes"
+  DOCKER_IMAGE: "secnotes"
+  DOCKER_TAG: "$CI_COMMIT_SHORT_SHA"
+  K8S_NAMESPACE: "secnotes"
+
+install_deps:
+  stage: prepare
+  tags:
+    - local
+  script:
+    - echo "[prepare] Installing dependencies"
+    - npm install
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - node_modules/
+
+unit_tests:
+  stage: test
+  tags:
+    - local
+  dependencies:
+    - install_deps
+  script:
+    - echo "[test] Running Jest tests"
+    - npm test -- --coverage --forceExit
+  artifacts:
+    paths:
+      - coverage/
+    expire_in: 1 week
+    when: always
+
+sonarqube_scan:
+  stage: sast
+  tags:
+    - local
+  dependencies:
+    - install_deps
+    - unit_tests
+  script:
+    - echo "[sast] Running SonarQube scan"
+    - |
+      sonar-scanner \
+        -Dsonar.host.url=$SONAR_HOST_URL \
+        -Dsonar.token=$SONAR_TOKEN \
+        -Dsonar.projectKey=secnotes \
+        -Dsonar.sources=src \
+        -Dsonar.tests=tests \
+        -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+  allow_failure: true
+
+docker_build:
+  stage: build
+  tags:
+    - local
+  script:
+    - echo "[build] Building Docker image"
+    - docker build -t $DOCKER_IMAGE:$DOCKER_TAG .
+    - docker tag $DOCKER_IMAGE:$DOCKER_TAG $DOCKER_IMAGE:latest
+    - docker images | grep $DOCKER_IMAGE
+
+deploy_k8s_local:
+  stage: deploy_local
+  tags:
+    - local
+  dependencies:
+    - docker_build
+  script:
+    - echo "[deploy_local] Deploying to Kubernetes"
+    - kubectl apply -f k8s/namespace.yaml
+    - kubectl apply -f k8s/configmap.yaml -n $K8S_NAMESPACE
+    - kubectl apply -f k8s/secret.yaml -n $K8S_NAMESPACE
+    - kubectl apply -f k8s/deployment.yaml -n $K8S_NAMESPACE
+    - kubectl apply -f k8s/service.yaml -n $K8S_NAMESPACE
+    - kubectl rollout status deployment/secnotes-app -n $K8S_NAMESPACE --timeout=120s
+    - kubectl get all -n $K8S_NAMESPACE
+  environment:
+    name: local
+    url: http://localhost:30080
+
+terraform_apply:
+  stage: infra_aws
+  tags:
+    - local
+  script:
+    - cd terraform
+    - terraform init
+    - terraform plan -out=tfplan
+    - terraform apply -auto-approve tfplan
+  when: manual
+  only:
+    - main
+  artifacts:
+    paths:
+      - terraform/terraform.tfstate
+    expire_in: 1 day
+
+k8s_aws_deploy:
+  stage: deploy_aws
+  tags:
+    - local
+  dependencies:
+    - terraform_apply
+    - docker_build
+  script:
+    - aws eks update-kubeconfig --name secnotes-cluster --region $AWS_DEFAULT_REGION
+    - kubectl apply -f k8s/namespace.yaml
+    - kubectl apply -f k8s/configmap.yaml -n $K8S_NAMESPACE
+    - kubectl apply -f k8s/secret.yaml -n $K8S_NAMESPACE
+    - kubectl apply -f k8s/deployment.yaml -n $K8S_NAMESPACE
+    - kubectl apply -f k8s/service.yaml -n $K8S_NAMESPACE
+    - kubectl rollout status deployment/secnotes-app -n $K8S_NAMESPACE --timeout=180s
+    - kubectl get svc -n $K8S_NAMESPACE
+  when: manual
+  only:
+    - main
+  environment:
+    name: production-aws
