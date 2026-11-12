@@ -52,4 +52,4 @@ curl -X POST http://localhost:3000/api/auth/register \
 
 ## Important Note
 The code is intentionally weak so that SonarQube, code review, and manual analysis have material to work with.
-"# secnotes_full_deployement" 
+
